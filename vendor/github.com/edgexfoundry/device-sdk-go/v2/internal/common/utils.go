@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/edgexfoundry/device-sdk-go/v2/internal/container"
+
 	bootstrapContainer "github.com/edgexfoundry/go-mod-bootstrap/v2/bootstrap/container"
 	"github.com/edgexfoundry/go-mod-bootstrap/v2/di"
 	"github.com/edgexfoundry/go-mod-core-contracts/v2/clients/interfaces"
@@ -20,8 +22,6 @@ import (
 	"github.com/edgexfoundry/go-mod-core-contracts/v2/dtos"
 	"github.com/edgexfoundry/go-mod-core-contracts/v2/dtos/requests"
 	"github.com/edgexfoundry/go-mod-messaging/v2/pkg/types"
-
-	"github.com/edgexfoundry/device-sdk-go/v2/internal/container"
 )
 
 func UpdateLastConnected(name string, lc logger.LoggingClient, dc interfaces.DeviceClient) {
@@ -54,16 +54,23 @@ func UpdateOperatingState(name string, state string, lc logger.LoggingClient, dc
 func SendEvent(event *dtos.Event, correlationID string, dic *di.Container) {
 	lc := bootstrapContainer.LoggingClientFrom(dic.Get)
 	configuration := container.ConfigurationFrom(dic.Get)
-	ctx := context.WithValue(context.Background(), common.CorrelationHeader, correlationID)
+	ctx := context.WithValue(context.Background(), common.CorrelationHeader, correlationID) // nolint: staticcheck
 	req := requests.NewAddEventRequest(*event)
+
+	bytes, encoding, err := req.Encode()
+	if err != nil {
+		lc.Error(err.Error())
+	}
+
+	// Check event size in kilobytes
+	if configuration.MaxEventSize > 0 && int64(len(bytes)) > configuration.MaxEventSize*1024 {
+		lc.Error(fmt.Sprintf("event size exceed MaxEventSize(%d KB)", configuration.MaxEventSize))
+		return
+	}
 
 	if configuration.Device.UseMessageBus {
 		mc := container.MessagingClientFrom(dic.Get)
-		bytes, encoding, err := req.Encode()
-		if err != nil {
-			lc.Error(err.Error())
-		}
-		ctx = context.WithValue(ctx, common.ContentType, encoding)
+		ctx = context.WithValue(ctx, common.ContentType, encoding) // nolint: staticcheck
 		envelope := types.NewMessageEnvelope(bytes, ctx)
 		publishTopic := fmt.Sprintf("%s/%s/%s/%s", configuration.MessageQueue.PublishTopicPrefix, event.ProfileName, event.DeviceName, event.SourceName)
 		err = mc.Publish(envelope, publishTopic)
@@ -72,7 +79,7 @@ func SendEvent(event *dtos.Event, correlationID string, dic *di.Container) {
 		}
 		lc.Debugf("Event(profileName: %s, deviceName: %s, sourceName: %s, id: %s) published to MessageBus", event.ProfileName, event.DeviceName, event.SourceName, event.Id)
 	} else {
-		ec := bootstrapContainer.DataEventClientFrom(dic.Get)
+		ec := bootstrapContainer.EventClientFrom(dic.Get)
 		_, err := ec.Add(ctx, req)
 		if err != nil {
 			lc.Errorf("Failed to push event to Coredata: %s", err)
