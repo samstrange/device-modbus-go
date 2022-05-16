@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 //
 // Copyright (C) 2017-2018 Canonical Ltd
-// Copyright (C) 2018-2021 IOTech Ltd
+// Copyright (C) 2018-2022 IOTech Ltd
 // Copyright (c) 2019 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -19,6 +19,13 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/edgexfoundry/device-sdk-go/v2/internal/clients"
+	sdkCommon "github.com/edgexfoundry/device-sdk-go/v2/internal/common"
+	"github.com/edgexfoundry/device-sdk-go/v2/internal/config"
+	"github.com/edgexfoundry/device-sdk-go/v2/internal/container"
+	restController "github.com/edgexfoundry/device-sdk-go/v2/internal/controller/http"
+	sdkModels "github.com/edgexfoundry/device-sdk-go/v2/pkg/models"
+
 	bootstrapConfig "github.com/edgexfoundry/go-mod-bootstrap/v2/bootstrap/config"
 	bootstrapContainer "github.com/edgexfoundry/go-mod-bootstrap/v2/bootstrap/container"
 	"github.com/edgexfoundry/go-mod-bootstrap/v2/bootstrap/flags"
@@ -34,13 +41,6 @@ import (
 	"github.com/edgexfoundry/go-mod-registry/v2/registry"
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
-
-	"github.com/edgexfoundry/device-sdk-go/v2/internal/clients"
-	sdkCommon "github.com/edgexfoundry/device-sdk-go/v2/internal/common"
-	"github.com/edgexfoundry/device-sdk-go/v2/internal/config"
-	"github.com/edgexfoundry/device-sdk-go/v2/internal/container"
-	restController "github.com/edgexfoundry/device-sdk-go/v2/internal/controller/http"
-	sdkModels "github.com/edgexfoundry/device-sdk-go/v2/pkg/models"
 )
 
 var (
@@ -68,6 +68,7 @@ type DeviceService struct {
 	deviceService   *models.DeviceService
 	driver          sdkModels.ProtocolDriver
 	discovery       sdkModels.ProtocolDiscovery
+	validator       sdkModels.DeviceValidator
 	manager         sdkModels.AutoEventManager
 	asyncCh         chan *sdkModels.AsyncValues
 	deviceCh        chan []sdkModels.DiscoveredDevice
@@ -105,6 +106,12 @@ func (s *DeviceService) Initialize(serviceName, serviceVersion string, proto int
 		s.discovery = nil
 	}
 
+	if validator, ok := proto.(sdkModels.DeviceValidator); ok {
+		s.validator = validator
+	} else {
+		s.validator = nil
+	}
+
 	s.deviceService = &models.DeviceService{}
 	s.config = &config.ConfigurationStruct{}
 }
@@ -113,14 +120,14 @@ func (s *DeviceService) UpdateFromContainer(r *mux.Router, dic *di.Container) {
 	s.LoggingClient = bootstrapContainer.LoggingClientFrom(dic.Get)
 	s.RegistryClient = bootstrapContainer.RegistryFrom(dic.Get)
 	s.SecretProvider = bootstrapContainer.SecretProviderFrom(dic.Get)
-	s.edgexClients.DeviceClient = bootstrapContainer.MetadataDeviceClientFrom(dic.Get)
-	s.edgexClients.DeviceServiceClient = bootstrapContainer.MetadataDeviceServiceClientFrom(dic.Get)
-	s.edgexClients.DeviceProfileClient = bootstrapContainer.MetadataDeviceProfileClientFrom(dic.Get)
-	s.edgexClients.ProvisionWatcherClient = bootstrapContainer.MetadataProvisionWatcherClientFrom(dic.Get)
-	s.edgexClients.EventClient = bootstrapContainer.DataEventClientFrom(dic.Get)
+	s.edgexClients.DeviceClient = bootstrapContainer.DeviceClientFrom(dic.Get)
+	s.edgexClients.DeviceServiceClient = bootstrapContainer.DeviceServiceClientFrom(dic.Get)
+	s.edgexClients.DeviceProfileClient = bootstrapContainer.DeviceProfileClientFrom(dic.Get)
+	s.edgexClients.ProvisionWatcherClient = bootstrapContainer.ProvisionWatcherClientFrom(dic.Get)
+	s.edgexClients.EventClient = bootstrapContainer.EventClientFrom(dic.Get)
 	s.config = container.ConfigurationFrom(dic.Get)
 	s.manager = container.ManagerFrom(dic.Get)
-	s.controller = restController.NewRestController(r, dic)
+	s.controller = restController.NewRestController(r, dic, s.ServiceName)
 }
 
 // Name returns the name of this Device Service
@@ -164,7 +171,14 @@ func (s *DeviceService) LoadCustomConfig(customConfig UpdatableConfig, sectionNa
 	if s.configProcessor == nil {
 		s.configProcessor = bootstrapConfig.NewProcessorForCustomConfig(s.flags, s.ctx, s.wg, s.dic)
 	}
-	return s.configProcessor.LoadCustomConfigSection(customConfig, sectionName)
+
+	if err := s.configProcessor.LoadCustomConfigSection(customConfig, sectionName); err != nil {
+		return err
+	}
+
+	s.controller.SetCustomConfigInfo(customConfig)
+
+	return nil
 }
 
 // ListenForCustomConfigChanges uses the Config Processor from go-mod-bootstrap to attempt to listen for
@@ -193,7 +207,7 @@ func (s *DeviceService) selfRegister() errors.EdgeX {
 		AdminState:  models.Unlocked,
 	}
 	*s.deviceService = localDeviceService
-	ctx := context.WithValue(context.Background(), common.CorrelationHeader, uuid.NewString())
+	ctx := context.WithValue(context.Background(), common.CorrelationHeader, uuid.NewString()) // nolint:staticcheck
 
 	s.LoggingClient.Debugf("trying to find device service %s", localDeviceService.Name)
 	res, err := s.edgexClients.DeviceServiceClient.DeviceServiceByName(ctx, localDeviceService.Name)
